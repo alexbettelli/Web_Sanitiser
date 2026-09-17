@@ -3,6 +3,11 @@ name = "sanitiser-cli"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "web-sanitizer"
+path = "src/main.rs"
+
 [dependencies]
 sanitiser-core = { path = "../sanitiser-core" }
 anyhow.workspace = true
+clap.workspace = true
