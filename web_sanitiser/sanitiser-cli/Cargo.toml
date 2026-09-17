@@ -1,0 +1,8 @@
+[package]
+name = "sanitiser-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sanitiser-core = { path = "../sanitiser-core" }
+anyhow.workspace = true
