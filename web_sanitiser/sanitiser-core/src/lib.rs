@@ -6,6 +6,7 @@
 pub mod config;
 pub mod report;
 pub mod error;
+pub mod input;
 
 pub use error::SanitiseError;
 pub use report::SanitiseReport;
