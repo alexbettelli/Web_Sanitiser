@@ -7,6 +7,8 @@ pub mod config;
 pub mod report;
 pub mod error;
 pub mod input;
+pub mod parser;
+pub mod sanitizer;
 
 pub use error::SanitiseError;
 pub use report::SanitiseReport;

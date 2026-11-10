@@ -234,6 +234,24 @@ Esempio:
 
 Gli script devono essere verificati rispetto a una allow-list/configurazione.
 
+Nel core è disponibile `remove_disallowed_scripts(document, &policy.scripts)`.
+La policy predefinita rimuove tutti gli script. Per autorizzarne alcuni si può
+usare `Policy::from_toml`, con la configurazione di esempio in
+[`web_sanitiser/policy.example.toml`](web_sanitiser/policy.example.toml):
+
+- `allowed_sources`: URL assoluti HTTP/HTTPS confrontati per intero dopo la
+  normalizzazione, inclusi percorso e query; nessun confronto per prefisso;
+- `allowed_inline`: contenuti inline esatti come presenti nel DOM, inclusi gli spazi.
+
+I riferimenti relativi, gli URL con credenziali e gli script SVG non sono
+autorizzati in questa prima versione. Una voce nell'allow-list autorizza il
+riferimento o il contenuto: non comporta download, esecuzione o analisi del JavaScript.
+Gli attributi evento degli script autorizzati vanno rimossi con la regola
+`remove_event_handlers`, come per gli altri elementi.
+
+Il caricamento della policy dalla CLI e il collegamento delle regole al motore
+sono ancora da implementare. Il fetching delle risorse resta una fase separata.
+
 ### URI pericolosi
 
 Esempio:

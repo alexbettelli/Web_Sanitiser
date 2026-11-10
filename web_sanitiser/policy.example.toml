@@ -1,0 +1,9 @@
+# Esempio per Policy::from_toml: la CLI non carica ancora questo file.
+# Policy::default() usa liste vuote e rimuove tutti gli script.
+
+[scripts]
+# Autorizza soltanto questi URL completi, senza scaricare le risorse.
+allowed_sources = ["https://cdn.example/assets/app.js?v=1"]
+
+# Autorizza soltanto questo contenuto inline esatto, inclusi gli spazi.
+allowed_inline = ["window.appReady = true;"]
