@@ -1,87 +1,33 @@
-# sanitiser-core — Appunti di sviluppo
+# sanitiser-core — Guida alle funzioni implementate
 
-Resoconto del lavoro del **10 novembre 2026**: parsing e serializzazione HTML,
-rimozione degli event handler inline, gestione degli script tramite allow-list.
+Questa guida accompagna la lettura delle funzioni scritte per il parsing HTML,
+la rimozione degli event handler e il controllo degli script. Ogni sezione
+indica il file da aprire e segue i dati dall'ingresso al risultato.
 
-Questo documento spiega soprattutto **il flusso dei dati**: da dove arrivano,
-quale funzione li riceve, come li trasforma e a chi restituisce il risultato.
-Descrive lo stato attuale del codice, distinguendolo dai collegamenti ancora
-da realizzare. I requisiti generali rimangono nel
-[README principale](../../README.md) e nel [PDF](../../final_project.pdf).
-
-## 1. Mappa del codice e stato attuale
-
-| File | Responsabilità | Stato |
-|---|---|---|
-| [src/input/local.rs](src/input/local.rs) | Leggere i byte di un file e individuare file locali | Già presente prima del lavoro sul parser |
-| [src/parser/html.rs](src/parser/html.rs) | Convertire byte HTML in DOM e DOM in byte HTML | Implementato e testato |
-| [src/sanitizer/html.rs](src/sanitizer/html.rs) | Rimuovere event handler e script non autorizzati | Implementato e testato |
-| [src/config.rs](src/config.rs) | Descrivere la policy degli script e leggerla da testo TOML | Implementato e testato |
-| [src/report.rs](src/report.rs) | Definire report e azioni serializzabili in JSON | Modello già presente, riutilizzato dalle regole |
-| [src/sanitizer/engine.rs](src/sanitizer/engine.rs) | Coordinare la pipeline | Ancora vuoto |
-| [src/lib.rs](src/lib.rs) | Esporre i moduli e l'ingresso pubblico `sanitise` | Moduli esposti; `sanitise` contiene ancora `todo!()` |
-| [CLI](../sanitiser-cli/src/main.rs) | Ricevere gli argomenti dell'utente e coordinare l'esecuzione | Riconosce ed elenca gli input; non chiama ancora le regole |
-
-Le singole funzioni del core possono già essere chiamate e combinate da codice
-Rust. Il programma da terminale non esegue ancora la pipeline completa.
-Chiamare oggi `sanitise` provoca il panic del suo `todo!()`.
-
-Il flusso completo da collegare sarà:
+Il collegamento tra le funzioni è questo:
 
 ```text
-Utente
-  │ indica input e configurazione
-  ▼
-CLI / programma che usa la libreria
-  ├── legge il file HTML ───────────────────────► Vec<u8>
-  └── legge il file TOML ─► Policy::from_toml ──► Policy
-                                                  │
-Vec<u8> ─► parse_html ─► DOM                        │
-                         │                        │
-                         ▼                        │
-                remove_event_handlers             │
-                         │                        │
-                         ▼                        ▼
-                remove_disallowed_scripts ◄── policy.scripts
-                         │
-                         ├── DOM modificato ─► serialize_html ─► byte HTML
-                         └── azioni ──────────────────────────► report
-
-CLI / livello di output: salvataggio dell'HTML e del report JSON
+byte HTML ──► parse_html ──► DOM modificabile
+                               │
+                               ├── remove_event_handlers ──────► azioni
+                               │
+testo TOML ──► Policy::from_toml │
+                    │          │
+                    └──────────┼── remove_disallowed_scripts ──► azioni
+                               │
+                               └── serialize_html ────────────► byte HTML
 ```
 
-I blocchi del parser, delle regole e della policy sono implementati. Il
-coordinamento nel motore, il caricamento dalla CLI e il salvataggio degli output
-sono ancora da collegare.
+È la composizione prevista per il motore. Le funzioni sono disponibili;
+`sanitise` in `src/lib.rs` contiene ancora `todo!()` e la CLI non le collega
+ancora in un'esecuzione completa.
 
-## 2. Parsing: dai byte HTML al DOM
+## 1. File `src/parser/html.rs`: costruire il DOM e produrre l'HTML
 
-### Cosa fa l'utente e da dove arrivano i dati
+Apri [src/parser/html.rs](src/parser/html.rs). In questo file ci sono le due
+conversioni: dai byte all'albero e dall'albero ai byte.
 
-L'utente sceglie un file, per esempio `pagina.html`. La stringa `"pagina.html"`
-è il **percorso**, non il contenuto del documento.
-
-Il file sul disco contiene byte. La funzione già presente
-`input::read_file(path)` usa `std::fs::read` e restituisce `Vec<u8>`.
-Non occorre prima creare una stringa e convertirla in byte.
-
-```text
-Percorso scelto dall'utente
-         │
-         ▼
-input::read_file(path)
-         │ restituisce i byte del contenuto
-         ▼
-Vec<u8>
-         │ il chiamante passa &bytes
-         ▼
-parse_html(input: &[u8])
-```
-
-Questo passaggio tra lettura e parsing è disponibile come insieme di API;
-non è ancora eseguito dalla CLI attuale.
-
-### Cosa contiene la funzione
+### `parse_html(input)`
 
 ```rust
 pub fn parse_html(input: &[u8]) -> Result<Html, Utf8Error> {
@@ -91,75 +37,35 @@ pub fn parse_html(input: &[u8]) -> Result<Html, Utf8Error> {
 }
 ```
 
-Il primo passaggio verifica che i byte rappresentino testo UTF-8. Se la
-verifica riesce, `from_utf8` restituisce `&str`, una vista testuale sugli stessi
-byte, senza creare una `String` intermedia.
+**Riceve:** i byte del contenuto HTML come `&[u8]`. Il chiamante può ottenerli
+con `read_file(path)`, già presente in
+[src/input/local.rs](src/input/local.rs). Il percorso `"pagina.html"` serve
+alla lettura del file: alla nostra funzione arriva il suo contenuto.
 
-Il secondo passaggio costruisce l'albero del documento. Usiamo `scraper::Html`:
-`scraper` impiega già **html5ever** come parser HTML5 e fornisce il DOM su cui
-lavorano le nostre regole. Non abbiamo scritto un parser HTML da zero.
+La riga `std::str::from_utf8(input)?` verifica che i byte siano UTF-8 validi e
+li rende leggibili come `&str`. Questa vista usa i byte ricevuti senza creare
+una `String` intermedia. Il `?` restituisce subito `Err(Utf8Error)` al chiamante
+se la verifica fallisce.
 
-```text
-&[u8]
-  │ std::str::from_utf8
-  ├── byte UTF-8 non validi ─► Err(Utf8Error) al chiamante
-  └── testo valido: &str
-           │ Html::parse_document, tramite html5ever
-           ▼
-       Ok(DOM)
-           │
-           ▼
-   chiamante / future regole
-```
-L'errore di codifica e un errore nella struttura HTML sono due cose diverse.
-Il parser HTML5 può recuperare molti documenti malformati, per esempio
-ricostruendo chiusure mancanti. La nostra funzione restituisce un errore per
-UTF-8 non valido; non rifiuta automaticamente ogni errore strutturale HTML.
-Altre codifiche non sono ancora supportate.
+`Html::parse_document(html)` costruisce il DOM. È una funzione di `scraper`,
+che usa `html5ever` come parser HTML5. Il parser può recuperare errori
+strutturali, come alcuni tag di chiusura mancanti. Questo recupero è distinto
+dalla verifica della codifica: la nostra funzione accetta solo UTF-8.
 
-### Cos'è il DOM restituito
-
-Per questo frammento:
-
-```html
-<button onclick="evil()">Premi</button>
-```
-
-il DOM contiene un elemento `button`, il suo attributo `onclick` e un nodo
-testuale con `Premi`, dentro la struttura del documento HTML.
-
-Il parsing **non rimuove** l'attributo: costruisce la struttura su cui agirà
-la regola successiva. Nel contesto del progetto è più preciso chiamare questa
-operazione *parsing*; il termine *deserializzazione* aiuta a ricordare la
-direzione testo → struttura.
-
-## 3. Serializzazione: dal DOM ai byte HTML
-
-### Da chi riceve il documento e a chi restituisce l'output
-
-Il chiamante conserva il DOM restituito dal parser e lo passa alle regole.
-Dopo le modifiche, passa quel DOM a `serialize_html`.
+**Restituisce:** `Ok(Html)`, cioè il documento strutturato. Il chiamante lo
+conserva in una variabile e lo passa alle regole di `src/sanitizer/html.rs`.
+Gli attributi pericolosi sono ancora presenti: questa funzione costruisce
+l'albero, sul quale lavoreranno le regole.
 
 ```text
-DOM costruito dal parser
-         │ modifiche delle regole
-         ▼
-DOM attuale
-         │ &document
-         ▼
-serialize_html
-         │ document.html()
-         ▼
-String contenente HTML
-         │ into_bytes()
-         ▼
-Vec<u8> restituito al chiamante
-         │
-         ▼
-Futuro livello di output: scrittura su file o altro utilizzo
+read_file(path) → Vec<u8> → parse_html(&bytes) → Result<Html, Utf8Error>
+                                                   │
+                                                   └── DOM alle regole
 ```
 
-La funzione è:
+### `serialize_html(document)`
+
+Sempre in [src/parser/html.rs](src/parser/html.rs):
 
 ```rust
 pub fn serialize_html(document: &Html) -> Vec<u8> {
@@ -167,98 +73,204 @@ pub fn serialize_html(document: &Html) -> Vec<u8> {
 }
 ```
 
-`&Html` permette di leggere il DOM senza consumarlo o modificarlo.
-`document.html()` crea il testo corrispondente all'albero corrente.
-`into_bytes()` consuma quella `String` e ne restituisce i byte senza copiarne
-il contenuto in un secondo buffer.
+**Riceve:** un riferimento al DOM, normalmente dopo le modifiche delle regole.
+`&Html` consente di leggerlo senza modificarlo o consumarlo.
 
-Le API usate restituiscono direttamente `String` e `Vec<u8>`: qui non c'è
-un errore di decodifica da propagare tramite `Result`.
+`document.html()` produce una `String` che rappresenta l'albero corrente.
+`into_bytes()` consuma quella stringa e restituisce il suo contenuto come
+`Vec<u8>`, senza una seconda copia dei byte. Le API usate restituiscono
+questi valori direttamente: qui non c'è un errore di decodifica da propagare.
 
-La serializzazione non conserva necessariamente spaziatura, virgolette e
-tag impliciti del file originale. Può comparire una struttura esplicita con
-`html`, `head` e `body`. È l'albero corrente a determinare l'output.
+**Restituisce:** i byte HTML al chiamante. Sarà il livello di output a scriverli
+su file. La formattazione può cambiare rispetto all'input: il parser può aver
+aggiunto tag impliciti, e la serializzazione ricostruisce l'HTML dal DOM.
 
-Questa funzione non salva file e non rimuove contenuti per conto proprio.
-Anche un DOM non ancora sanitizzato può essere serializzato.
+```text
+DOM modificato → serialize_html(&document) → Vec<u8> → futuro salvataggio
+```
 
-## 4. Event handler inline: onclick, onload, onerror e simili
+## 2. File `src/config.rs`: costruire e interrogare la policy
 
-### Input e risultato della regola
+Apri [src/config.rs](src/config.rs). La struttura `Policy` contiene il campo
+`scripts: ScriptPolicy`. Quest'ultimo contiene due liste di stringhe:
+
+- `allowed_sources`: URL completi degli script esterni autorizzati;
+- `allowed_inline`: contenuti esatti degli script inline autorizzati.
+
+Le funzioni di questo file leggono o interrogano la configurazione. Il DOM
+viene modificato dalle funzioni di `src/sanitizer/html.rs`.
+
+### `Policy::from_toml(input)`
+
+```rust
+pub fn from_toml(input: &str) -> Result<Self, toml::de::Error> {
+    toml::from_str(input)
+}
+```
+
+**Riceve:** testo TOML già letto dal chiamante. La funzione non apre il file.
+Per esempio, il testo di [policy.example.toml](../policy.example.toml) è:
+
+```toml
+[scripts]
+allowed_sources = ["https://cdn.example/assets/app.js?v=1"]
+allowed_inline = ["window.appReady = true;"]
+```
+
+`toml::from_str` usa le definizioni delle strutture per costruire `Policy`.
+Gli attributi `#[serde(default, deny_unknown_fields)]` permettono di usare i
+valori predefiniti per i campi omessi e fanno rifiutare i campi sconosciuti.
+Anche sintassi e tipi errati producono un errore.
+
+**Restituisce:** `Policy` oppure un errore TOML. Il chiamante passerà
+`&policy.scripts` a `remove_disallowed_scripts`.
+`Policy::default()` e le configurazioni senza liste producono liste vuote:
+quando applicheremo la regola, tutti gli script saranno rimossi.
+
+```text
+utente scrive il TOML → chiamante legge il testo → Policy::from_toml
+                                                         │
+                                                         └── Policy
+                                                               │
+                                                               └── &policy.scripts alla regola
+```
+
+### `ScriptPolicy::allows_source(source)`
+
+Sempre in [src/config.rs](src/config.rs):
+
+```rust
+pub fn allows_source(&self, source: &str) -> bool
+```
+
+**Riceve:** un valore di `src` estratto da un elemento script. `&self` è la
+policy che contiene gli URL autorizzati.
+
+La funzione chiama `parse_script_url(source)`. Se il riferimento non è
+supportato, restituisce `false`. Altrimenti interpreta allo stesso modo le
+voci di `allowed_sources` e confronta gli URL normalizzati per intero,
+compresi percorso e query. Non usa confronti per prefisso o sottostringa.
+Le voci della lista non interpretabili vengono ignorate durante il confronto.
+
+**Restituisce:** `true` o `false` a `is_allowed_script`, definita in
+`src/sanitizer/html.rs`. La decisione finale di rimozione spetta alla regola.
+
+Con il TOML dell'esempio:
+
+| `source` ricevuto | Risultato |
+|---|---|
+| `https://cdn.example/assets/app.js?v=1` | `true` |
+| `HTTPS://CDN.EXAMPLE:443/assets/app.js?v=1` | `true`, dopo normalizzazione |
+| `https://cdn.example/assets/app.js?v=2` | `false` |
+| `https://cdn.example.evil.test/assets/app.js?v=1` | `false` |
+| `/assets/app.js` | `false` |
+
+### `parse_script_url(value)`
+
+Questa funzione privata, sempre in [src/config.rs](src/config.rs), è chiamata
+soltanto da `allows_source`:
+
+```rust
+fn parse_script_url(value: &str) -> Option<Url>
+```
+
+**Riceve:** una stringa proveniente da `src` oppure da `allowed_sources`.
+Richiede la presenza di `://`, prova a interpretare l'URL con `Url::parse`
+e accetta solo HTTP/HTTPS senza nome utente o password.
+
+**Restituisce:** `Some(Url)` se il riferimento soddisfa questi controlli,
+altrimenti `None`. Il `?` applicato a `Option` interrompe la funzione
+restituendo `None` quando manca un dato necessario.
+
+Perciò riferimenti relativi, forme come `https:app.js`, URL con credenziali e
+schemi come `javascript:`, `data:` o `file:` vengono rifiutati anche se
+inseriti nella lista. Per supportare i relativi servirà il contesto della pagina.
+
+### `ScriptPolicy::allows_inline(content)`
+
+La funzione in [src/config.rs](src/config.rs) esegue questo confronto:
+
+```rust
+self.allowed_inline.iter().any(|allowed| allowed == content)
+```
+
+**Riceve:** il testo dello script ricavato dal DOM. **Restituisce:** `true`
+solo se coincide con una voce di `allowed_inline`, altrimenti `false`.
+Spazi e ritorni a capo contano come parte del testo dopo le normalizzazioni
+compiute dal parser HTML.
+
+Con la voce `"window.appReady = true;"`, il contenuto esatto è autorizzato;
+`" window.appReady = true;"` e `"window.appReady = true; evil();"` sono rifiutati.
+Il risultato torna a `is_allowed_script` in `src/sanitizer/html.rs`.
+
+## 3. File `src/sanitizer/html.rs`: rimuovere gli event handler
+
+Apri [src/sanitizer/html.rs](src/sanitizer/html.rs). Qui lavoriamo sul DOM
+costruito da `parse_html`, usando il modello di azione già definito in
+[src/report.rs](src/report.rs).
+
+### `remove_event_handlers(document)`
 
 ```rust
 pub fn remove_event_handlers(document: &mut Html) -> Vec<SanitiseAction>
 ```
 
-Il chiamante passa il DOM come `&mut Html`: la funzione prende in prestito
-l'albero con il permesso di modificarlo. Non riceve percorsi o testo HTML.
-Restituisce un elenco di azioni; il DOM viene modificato direttamente.
+**Riceve:** il DOM come riferimento modificabile. Il chiamante conserva la
+proprietà del documento; la funzione ne modifica direttamente gli attributi.
+
+Il corpo della funzione segue questi passaggi:
+
+1. `descendants()` visita i nodi del documento; `ElementRef::wrap` seleziona
+   quelli che rappresentano elementi.
+2. `is_event_handler` controlla i nomi degli attributi. Per gli elementi
+   interessati, la funzione raccoglie l'identificativo e la posizione
+   calcolata da `element_location`.
+3. `get_mut(node_id)` permette di modificare l'elemento individuato.
+4. `element.attrs.retain(...)` decide quali attributi conservare: `true`
+   mantiene l'attributo; `false` lo elimina.
+5. Prima di eliminarlo, la funzione aggiunge una `SanitiseAction` ad `actions`.
+
+La raccolta iniziale separa la lettura dell'albero dalla sua modifica.
+Per un bottone con `class="primary"` e `onclick="evil()"`, scompare soltanto
+`onclick`: il bottone, il testo e `class` restano nel DOM.
+
+**Restituisce:** un vettore di azioni al chiamante, che potrà aggiungerlo a
+`report.actions`. Il DOM modificato rimane disponibile per la regola sugli
+script e per `serialize_html`.
 
 ```text
-Chiamante con un DOM
-         │ &mut document
-         ▼
-remove_event_handlers
-         ├── modifica gli attributi nel DOM ricevuto
-         └── restituisce Vec<SanitiseAction>
-                    │
-                    ▼
-           il chiamante aggiorna il report
-
-Il DOM modificato prosegue verso le altre regole e la serializzazione.
+remove_event_handlers                         [src/sanitizer/html.rs]
+  ├── is_event_handler(nome) → attributo da rimuovere?
+  ├── element_location(elemento) → posizione per il report
+  ├── retain → modifica gli attributi del DOM
+  └── Vec<SanitiseAction> → chiamante → report.actions
 ```
 
-L'utente non deve elencare a mano ogni `onclick`: la regola li cerca nel DOM.
-Attualmente la sua applicazione è decisa dal chiamante; non esiste ancora
-un'opzione CLI per abilitarla o disabilitarla.
+### `is_event_handler(name)`
 
-### Come individua e rimuove gli attributi
+È una funzione privata dello stesso file:
 
-1. Visita gli elementi collegati all'albero del documento.
-2. Individua gli attributi con nome locale che inizia con `on`, ignorando
-   maiuscole e minuscole, tramite `is_event_handler`.
-3. Raccoglie identificativi e posizioni degli elementi interessati.
-4. Accede agli elementi in modo modificabile e usa `retain` sugli attributi.
-5. Per ogni attributo rimosso produce una `SanitiseAction`.
-
-La raccolta iniziale permette di separare la lettura dell'albero dalla sua
-modifica. `retain` conserva gli attributi per cui la funzione restituisce
-`true` ed elimina quelli per cui restituisce `false`.
-
-È una regola conservativa basata sul prefisso `on`, non un catalogo dei soli
-eventi standard. `data-onclick` non inizia con `on` e viene conservato.
-
-Prima:
-
-```html
-<button class="primary" onclick="evil()">Premi</button>
-```
-
-Dopo, come frammento:
-
-```html
-<button class="primary">Premi</button>
-```
-
-Il bottone, il testo e gli altri attributi rimangono. Per un attributo rimosso
-il report contiene, per esempio:
-
-```json
-{
-  "rule": "remove-event-handler",
-  "location": "/html[1]/body[1]/button[1]/@onclick",
-  "original_fragment": "onclick=\"evil()\"",
-  "replacement": ""
+```rust
+fn is_event_handler(name: &str) -> bool {
+    name.get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on"))
 }
 ```
 
-Il frammento è ricostruito dai valori del DOM, con le necessarie escape per
-virgolette e `&`: non è una copia della grafia esatta presente nel file.
-In questa regola una seconda applicazione non produce ulteriori rimozioni.
+**Riceve:** il nome locale di un attributo. **Restituisce:** `true` se i primi
+due caratteri sono `on`, ignorando maiuscole e minuscole.
+Per esempio `onclick`, `onload`, `onerror` e `ONFOCUS` corrispondono;
+`class`, `src` e `data-onclick` non corrispondono.
 
-## 5. Script e allow-list
+È una regola conservativa sul prefisso, non un elenco dei soli eventi standard.
+La funzione riconosce il nome; è `remove_event_handlers` a eliminare l'attributo.
 
-### Le due decisioni: riconoscere e autorizzare
+## 4. File `src/sanitizer/html.rs`: rimuovere gli script non autorizzati
+
+Restiamo in [src/sanitizer/html.rs](src/sanitizer/html.rs). Questa regola
+riceve anche la policy preparata dalle funzioni di `src/config.rs`.
+
+### `remove_disallowed_scripts(document, policy)`
 
 ```rust
 pub fn remove_disallowed_scripts(
@@ -267,209 +279,118 @@ pub fn remove_disallowed_scripts(
 ) -> Vec<SanitiseAction>
 ```
 
-La funzione riceve il DOM dal chiamante e la configurazione degli script da
-`policy.scripts`. Usa due controlli distinti:
+**Riceve:** il DOM modificabile e la policy degli script in sola lettura.
 
-- `is_script` riconosce gli elementi con nome locale `script`;
-- `is_allowed_script` decide se conservarli in base a namespace, presenza
-  di `src` e allow-list.
-
-```text
-DOM + policy.scripts
-         │
-         ▼
-Elemento script?
-  ├── no ─► la regola lo lascia invariato
-  └── sì
-       │
-       ├── namespace diverso da HTML, per esempio SVG ─► rimozione
-       └── namespace HTML
-            │
-            ├── attributo src presente
-            │      └── verifica allowed_sources
-            └── attributo src assente
-                   └── verifica allowed_inline
-
-Autorizzato ─► resta nel DOM
-Non autorizzato ─► elemento e contenuto scollegati dal DOM + azione restituita
-```
-
-Le posizioni e i frammenti vengono acquisiti prima delle rimozioni, evitando
-che gli indici dei fratelli cambino mentre si costruisce il report.
-`detach()` scollega il sottoalbero: il relativo script non comparirà più
-nell'HTML serializzato. Il report usa la regola `remove-disallowed-script`,
-il frammento dell'intero elemento e una sostituzione vuota.
-
-### Da dove arriva la policy
-
-La configurazione è definita in `config.rs`:
+La visita iniziale individua gli elementi che soddisfano questa condizione:
 
 ```rust
-pub struct Policy {
-    pub scripts: ScriptPolicy,
-}
-
-pub struct ScriptPolicy {
-    pub allowed_sources: Vec<String>,
-    pub allowed_inline: Vec<String>,
-}
+is_script(*element) && !is_allowed_script(*element, policy)
 ```
 
-Il file [policy.example.toml](../policy.example.toml) mostra il formato:
+Per ogni elemento da rimuovere prepara una `SanitiseAction` con il frammento
+HTML e la posizione originale. Questa preparazione avviene prima delle
+rimozioni, così gli indici dei fratelli rimangono quelli iniziali.
 
-```toml
-[scripts]
-allowed_sources = ["https://cdn.example/assets/app.js?v=1"]
-allowed_inline = ["window.appReady = true;"]
-```
+Nel secondo ciclo, `node.detach()` scollega l'elemento e il suo contenuto
+dall'albero del documento: lo script non comparirà nell'HTML serializzato.
+Gli elementi autorizzati rimangono collegati al DOM.
 
-Il percorso previsto per la configurazione è:
+**Restituisce:** le azioni di rimozione al chiamante. Anche qui il documento
+viene modificato direttamente, senza restituire un nuovo DOM.
 
 ```text
-Utente scrive il file TOML
-         │
-         ▼
-Chiamante legge il file come testo
-         │ &str
-         ▼
-Policy::from_toml(config_text)
-         ├── errore di sintassi, tipo o campo sconosciuto ─► Err al chiamante
-         └── configurazione valida ─► Policy
-                                          │ &policy.scripts
-                                          ▼
-                              remove_disallowed_scripts
+remove_disallowed_scripts                     [src/sanitizer/html.rs]
+  ├── is_script → è un elemento script?
+  ├── is_allowed_script → la policy lo autorizza?
+  │     ├── allows_source → parse_script_url   [src/config.rs]
+  │     └── allows_inline                     [src/config.rs]
+  ├── element_location + element.html() → dati dell'azione
+  ├── detach → scollega lo script dal DOM
+  └── Vec<SanitiseAction> → chiamante → report.actions
 ```
 
-`Policy::from_toml` deserializza **testo già ricevuto**: non apre file.
-I campi omessi assumono i valori predefiniti. `Policy::default()`, un TOML
-vuoto o una sezione `[scripts]` senza liste producono liste vuote; quando
-la regola viene applicata, tutti gli script vengono quindi rimossi.
+### `is_script(element)`
 
-### Script esterni: allowed_sources
+Questa funzione privata di [src/sanitizer/html.rs](src/sanitizer/html.rs)
+confronta il nome locale dell'elemento con `"script"`, ignorando il caso.
+Riceve un `ElementRef` e restituisce un `bool`. Il riconoscimento comprende
+anche gli script in namespace diversi da HTML; l'autorizzazione viene
+valutata dalla funzione successiva.
 
-Per `<script src="...">`, `allows_source` interpreta l'URL tramite la crate
-`url` e confronta l'intero URL normalizzato con le voci autorizzate.
-Non usa sottostringhe, prefissi, wildcard o la sola appartenenza a un dominio.
+### `is_allowed_script(element, policy)`
 
-Con la configurazione dell'esempio:
+Sempre in [src/sanitizer/html.rs](src/sanitizer/html.rs), la funzione riceve
+lo script e la policy e restituisce un `bool`.
 
-| Riferimento | Esito |
+Per prima cosa verifica il namespace dell'elemento: nella versione attuale
+soltanto gli script HTML possono essere autorizzati. Gli script SVG vengono
+rimossi. Per gli script HTML, il passaggio centrale è:
+
+```rust
+match element.value().attr("src") {
+    Some(source) => policy.allows_source(source),
+    None => policy.allows_inline(&element.text().collect::<String>()),
+}
+```
+
+Se esiste `src`, il suo valore viene passato ad `allows_source` in
+`src/config.rs`. Se manca, il testo dello script viene raccolto in una
+`String` e passato ad `allows_inline`, nello stesso file della policy.
+
+Un `src=""` entra comunque nel ramo `Some`: il riferimento viene rifiutato
+senza provare l'allow-list inline. Il risultato torna a
+`remove_disallowed_scripts`, che rimuove lo script quando riceve `false`.
+Non ci sono esenzioni automatiche in base all'attributo `type`.
+
+Autorizzare uno script non autorizza gli event handler sul suo elemento:
+per rimuovere un eventuale `onload` dobbiamo applicare anche
+`remove_event_handlers`. Nessuna di queste funzioni scarica o esegue JavaScript.
+L'allow-list degli esterni autorizza il riferimento, non verifica il suo
+contenuto remoto; il fetching rimane un modulo successivo.
+
+## 5. File `src/sanitizer/html.rs`: descrivere la posizione delle modifiche
+
+### `element_location(element)`
+
+Questa funzione privata di [src/sanitizer/html.rs](src/sanitizer/html.rs)
+è condivisa dalle due regole di rimozione:
+
+```rust
+fn element_location(element: ElementRef<'_>) -> String
+```
+
+**Riceve:** un elemento del DOM. Risale ai suoi antenati e, per ciascun
+livello, conta i fratelli precedenti con lo stesso nome qualificato.
+Costruisce le parti del percorso, le inverte e le unisce con `/`.
+I nodi intermedi che non sono elementi, come il frammento di un template,
+vengono attraversati mentre si cercano gli antenati.
+
+**Restituisce:** un percorso come
+`/html[1]/body[1]/main[1]/button[2]`. L'indice distingue i bottoni ripetuti.
+`remove_event_handlers` aggiunge il nome dell'attributo, per esempio
+`/@onclick`; la regola sugli script usa la posizione dell'intero elemento.
+
+Le azioni sono definite in [src/report.rs](src/report.rs):
+
+| Campo di `SanitiseAction` | Valore prodotto dalle regole |
 |---|---|
-| `https://cdn.example/assets/app.js?v=1` | Autorizzato |
-| `HTTPS://CDN.EXAMPLE:443/assets/app.js?v=1` | Autorizzato dopo normalizzazione |
-| `https://cdn.example/other.js?v=1` | Rimosso: percorso diverso |
-| `https://cdn.example/assets/app.js?v=2` | Rimosso: query diversa |
-| `https://cdn.example.evil.test/assets/app.js?v=1` | Rimosso: dominio diverso |
-| `/assets/app.js` o `//cdn.example/assets/app.js?v=1` | Rimosso: manca un URL assoluto esplicito |
-| `https:cdn.example/assets/app.js?v=1` | Rimosso: forma ambigua senza `://` |
-| `javascript:...`, `data:...`, `file:...` | Rimosso: schema non supportato |
-| URL con nome utente o password | Rimosso |
+| `rule` | `remove-event-handler` oppure `remove-disallowed-script` |
+| `location` | Percorso calcolato da `element_location`, con eventuale attributo |
+| `original_fragment` | Attributo ricostruito oppure HTML dello script prima della rimozione |
+| `replacement` | Stringa vuota, perché la modifica è una rimozione |
 
-Le liste possono autorizzare solo URL validi HTTP/HTTPS nella forma supportata;
-inserire un riferimento relativo o uno schema vietato nella lista non lo abilita.
-Per i relativi servirà il contesto della pagina, oggi non passato a questa regola.
+Il frammento deriva dal DOM, quindi può differire dalla formattazione originale.
+Le funzioni restituiscono strutture Rust; il livello di output potrà convertirle
+in JSON usando il modello serializzabile già presente in `src/report.rs`.
 
-### Script inline: allowed_inline
+## 6. Collegare le funzioni: un esempio di chiamante
 
-Per gli script senza `src`, il contenuto testuale del DOM deve coincidere
-esattamente con una voce della lista. Spazi e ritorni a capo fanno parte
-del confronto dopo le normalizzazioni del parsing HTML.
-
-Con `allowed_inline = ["window.appReady = true;"]`:
-
-```html
-<!-- Conservato: contenuto esatto -->
-<script>window.appReady = true;</script>
-
-<!-- Rimosso: codice aggiuntivo -->
-<script>window.appReady = true; evil();</script>
-
-<!-- Rimosso: spazio iniziale non presente nella voce autorizzata -->
-<script> window.appReady = true;</script>
-```
-
-Un `src` presente ma vuoto o invalido non fa ripiegare sull'allow-list inline.
-La regola tratta conservativamente tutti gli elementi `script`, senza
-esenzioni automatiche in base a `type`. Gli script SVG vengono rimossi anche
-se un loro URL o contenuto compare nelle liste per gli script HTML.
-
-### Interazione con event handler e download
-
-Un riferimento autorizzato non autorizza gli attributi evento dello stesso
-elemento. Per questo l'esempio di pipeline applica anche
-`remove_event_handlers`: un `<script src="URL_APPROVATO" onload="evil()">`
-può conservare il riferimento e perdere `onload`.
-
-Questa regola non scarica né esegue JavaScript e non analizza se il suo
-contenuto sia maligno. La lista esprime una decisione esplicita di fiducia:
-per gli esterni autorizza il riferimento, non certifica il contenuto remoto.
-
-Nel PDF il download delle sub-risorse è opzionale e richiede limiti su
-profondità, numero di richieste e byte totali. Rimane separato dal controllo
-del DOM. Un tag conservato può essere caricato successivamente dal browser;
-non viene scaricato dal sanitiser durante questa funzione.
-
-## 6. Cosa può passare oggi l'utente dalla linea di comando
-
-Eseguendo i comandi dalla directory `web_sanitiser`, gli esempi supportati per
-la classificazione degli input sono:
-
-```powershell
-cargo run --package sanitiser-cli -- pagina.html
-cargo run --package sanitiser-cli -- pagina1.html pagina2.html
-cargo run --package sanitiser-cli -- ./sito/
-cargo run --package sanitiser-cli -- urls.txt
-cargo run --package sanitiser-cli -- https://example.org/
-```
-
-I percorsi locali devono esistere. `urls.txt` viene riconosciuto come lista
-quando contiene URL HTTP/HTTPS validi, oltre a eventuali righe vuote o commenti
-che iniziano con `#`.
-
-Il **flusso effettivo della CLI attuale** termina qui:
-
-```text
-Argomenti testuali dell'utente
-         │ clap: Args.inputs
-         ▼
-input::resolve_args
-         │ Vec<Input>
-         ▼
-main: stampa file, directory o URL
-         │ per le directory usa anche walk_directory
-         ▼
-Fine: nessuna chiamata al parser o alle regole
-```
-
-Il riconoscimento di un URL non comporta un download. La presenza di più
-argomenti non comporta ancora sanitizzazione batch o elaborazione concorrente.
-
-Non sono ancora implementati gli argomenti `--config`, `--output`, `--fetch`
-o flag per inserire direttamente voci nell'allow-list. `--help` e `--version`
-sono forniti da `clap`. Il file TOML di esempio non viene caricato automaticamente.
-Passarlo oggi come semplice argomento posizionale non lo rende una policy.
-
-**La lista di URL in ingresso e l'allow-list sono due dati diversi:**
-
-| Dato | Significato | Destinatario |
-|---|---|---|
-| `urls.txt` | Pagine o risorse da elaborare, con URL HTTP/HTTPS | Risoluzione degli input |
-| `allowed_sources` nel TOML | Riferimenti esterni degli script da conservare | Policy degli script |
-| `allowed_inline` nel TOML | Contenuti inline degli script da conservare | Policy degli script |
-
-Quando aggiungeremo il caricamento della configurazione alla CLI, l'utente
-potrà indicare il percorso del TOML. La CLI ne leggerà il testo e passerà
-la `Policy` al motore. Oggi questa composizione è possibile solo chiamando
-le API da codice Rust, come nell'esempio seguente.
-
-## 7. Come comporre le funzioni già disponibili
-
-Questo esempio usa le API attuali, ma **non è ancora il corpo della funzione
-pubblica `sanitise`**. Mostra il collegamento che dovrà fare il motore.
+Questo esempio combina le API descritte. È il collegamento da trasferire nel
+motore: [src/sanitizer/engine.rs](src/sanitizer/engine.rs) è ancora vuoto e
+`sanitise` in [src/lib.rs](src/lib.rs) contiene ancora `todo!()`.
 
 ```rust
 use std::error::Error;
-
 use sanitiser_core::config::Policy;
 use sanitiser_core::parser::html::{parse_html, serialize_html};
 use sanitiser_core::report::SanitiseReport;
@@ -481,56 +402,50 @@ fn esempio_pipeline(
     input: &[u8],
     config_text: &str,
 ) -> Result<(Vec<u8>, SanitiseReport), Box<dyn Error>> {
-    let policy = Policy::from_toml(config_text)?;
-    let mut document = parse_html(input)?;
-    let mut report = SanitiseReport::default();
+    let policy = Policy::from_toml(config_text)?;       // src/config.rs
+    let mut document = parse_html(input)?;            // src/parser/html.rs
+    let mut report = SanitiseReport::default();       // src/report.rs
 
-    report.actions.extend(remove_event_handlers(&mut document));
-    report.actions.extend(remove_disallowed_scripts(
-        &mut document,
-        &policy.scripts,
-    ));
+    report.actions.extend(
+        remove_event_handlers(&mut document),         // src/sanitizer/html.rs
+    );
+    report.actions.extend(
+        remove_disallowed_scripts(&mut document, &policy.scripts),
+    );
 
-    let output = serialize_html(&document);
+    let output = serialize_html(&document);           // src/parser/html.rs
     Ok((output, report))
 }
 ```
 
-Il chiamante deve avere già letto i byte HTML e il testo della configurazione.
-Riceve poi due risultati distinti:
+Il chiamante riceve il contenuto HTML elaborato e il report. Dovrà poi salvarli.
+`Box<dyn Error>` semplifica l'esempio; il motore definitivo dovrà raccordare
+gli errori TOML e UTF-8 con il tipo di errore pubblico del core.
 
-- `Vec<u8>`: contenuto HTML prodotto dalle regole attualmente implementate;
-- `SanitiseReport`: elenco delle azioni accumulate con `extend`.
+### Da dove entreranno gli argomenti dell'utente
 
-`Box<dyn Error>` serve qui a semplificare l'esempio, propagando sia errori
-TOML sia errori UTF-8. L'integrazione definitiva dovrà raccordarli al tipo
-di errore pubblico del core.
+Nel file [sanitiser-cli/src/main.rs](../sanitiser-cli/src/main.rs), `main`
+riceve gli input da `Args::parse()` e li passa a `input::resolve_args`.
+Oggi stampa gli input riconosciuti e, per le directory, elenca i file.
+Il collegamento alle funzioni sopra deve ancora essere implementato.
 
-Le regole restituiscono azioni Rust, non stringhe JSON. Il modello del report
-deriva `serde::Serialize`, quindi il livello di output potrà convertirlo in
-JSON con `serde_json` e scriverlo. Né il parser né le regole salvano file.
-In questo stadio sono implementati solo i controlli descritti nel documento:
-l'output non ha ancora attraversato tutte le verifiche richieste dal progetto.
+La CLI accetta percorsi di file, directory, liste di URL e URL HTTP/HTTPS,
+anche come più argomenti. Non sono ancora presenti `--config`, `--output`
+o `--fetch`. Il riconoscimento di un URL non avvia un download.
 
-## 8. Verifiche effettuate e punto di ripresa
+Quando aggiungeremo il caricamento della configurazione, il flusso sarà:
 
-L'ultima verifica del codice ha completato **17 test**, con esito positivo,
-eseguendo dalla directory `web_sanitiser`:
-
-```powershell
-cargo test --workspace --offline --locked
+```text
+percorso HTML dalla CLI → read_file → byte per parse_html
+percorso TOML dalla CLI → lettura del testo → Policy::from_toml
 ```
 
-`--offline` richiede che le dipendenze siano già disponibili nella cache.
-I test coprono UTF-8 invalido, recupero di HTML malformato, serializzazione di
-accenti ed entità, rimozione degli eventi e conservazione degli altri contenuti,
-configurazioni TOML, comportamento predefinito, confronti esatti delle allow-list,
-URL ingannevoli, script nei template e in SVG, correttezza delle azioni e
-riapplicazione delle regole senza ulteriori rimozioni.
+`urls.txt` identifica gli input da elaborare; `allowed_sources` nel TOML
+identifica gli script da autorizzare. Passare il TOML come semplice argomento
+posizionale oggi non lo carica come policy.
 
-Alla ripresa restano da sviluppare il coordinamento in `engine.rs`, il
-collegamento di `sanitise`, la gestione degli errori del parser e della policy
-nel modello pubblico, il caricamento della configurazione nella CLI e il
-salvataggio degli output. Le ulteriori regole HTML, come meta refresh,
-iframe/object e URI pericolosi, rimangono da aggiungere. Il fetching delle
-risorse costituisce un lavoro successivo e separato.
+I test delle funzioni si trovano nei blocchi `#[cfg(test)]` di
+`src/parser/html.rs`, `src/config.rs` e `src/sanitizer/html.rs`.
+L'ultima verifica del codice ha completato 17 test con esito positivo.
+Dalla directory `web_sanitiser` si possono eseguire con
+`cargo test --workspace --offline --locked`, se le dipendenze sono in cache.
