@@ -1,4 +1,9 @@
 //! Regole di sanitizzazione della struttura HTML.
+//!
+//! Il chiamante passa il DOM costruito dal parser. Le due funzioni pubbliche
+//! lo modificano direttamente e restituiscono le azioni da aggiungere al report.
+//! Le funzioni private riconoscono gli elementi, verificano le autorizzazioni
+//! e costruiscono le posizioni delle modifiche nel documento.
 
 use scraper::{ElementRef, Html, Node};
 
@@ -7,49 +12,75 @@ use crate::report::SanitiseAction;
 
 /// Rimuove gli attributi il cui nome locale inizia con `on`, ignorando il caso.
 ///
-/// Conserva gli elementi e il loro contenuto. Restituisce un'azione per ogni
-/// attributo rimosso; il frammento riportato è ricostruito dai valori del DOM.
-/// Una sostituzione vuota indica che l'attributo è stato eliminato.
+/// Riceve il DOM tramite `&mut Html`: può modificarlo, mentre il chiamante
+/// continua a possederlo. Conserva gli elementi, il testo e gli altri attributi.
+/// Per esempio, da `<button onclick="evil()">Premi</button>` elimina solo onclick.
+///
+/// Prima raccoglie gli elementi interessati, poi ne modifica gli attributi.
+/// Restituisce un'azione per ogni attributo rimosso: il chiamante potrà unire
+/// queste azioni al report e passare il DOM alla regola successiva.
+/// Il frammento è ricostruito dal DOM; la sostituzione vuota indica la rimozione.
 pub fn remove_event_handlers(document: &mut Html) -> Vec<SanitiseAction> {
-    // Prima leggiamo il DOM e raccogliamo gli identificativi e le posizioni.
-    // In questo modo possiamo modificarlo nel ciclo successivo.
+    // Fase 1: leggiamo il DOM senza modificarlo. Separare lettura e modifica
+    // evita di mantenere prestiti immutabili dell'albero mentre lo mutiamo.
     let elements: Vec<_> = document
         .tree
         .root()
+        // Visita la radice e tutti i suoi discendenti, compresi testo e commenti.
         .descendants()
+        // wrap restituisce Some solo per i nodi elemento: gli altri sono scartati.
         .filter_map(ElementRef::wrap)
         .filter(|element| {
+            // value dà accesso ai dati dell'elemento, tra cui la lista attrs.
+            // any risponde: "Esiste almeno un attributo evento su questo tag?"
+            // Qui usiamo solo il nome; il valore dell'attributo è ignorato con _.
             element
                 .value()
                 .attrs
                 .iter()
                 .any(|(name, _)| is_event_handler(name.local.as_ref()))
         })
+        // Per ogni elemento selezionato conserviamo ID e posizione nel DOM.
+        // Il vettore contiene queste coppie, non copie degli elementi HTML.
         .map(|element| (element.id(), element_location(element)))
         .collect();
 
+    // Le azioni descrivono le modifiche effettuate; non sono ancora testo JSON.
     let mut actions = Vec::new();
 
+    // Fase 2: la lettura iniziale è terminata e possiamo modificare il DOM.
     for (node_id, location) in elements {
+        // Recupera il nodo modificabile tramite il suo ID. Se manca, passa oltre.
         let Some(mut node) = document.tree.get_mut(node_id) else {
             continue;
         };
+        // Node è un enum: prendiamo i dati del caso Element, saltando altri tipi.
         let Node::Element(element) = node.value() else {
             continue;
         };
 
-        // retain conserva solo gli attributi per cui restituiamo true.
+        // retain chiama questa closure per ogni attributo:
+        // true = conserva l'attributo; false = rimuovi l'attributo.
         element.attrs.retain(|(name, value)| {
+            // name.local è il nome senza prefisso, per esempio "onclick".
             if !is_event_handler(name.local.as_ref()) {
+                // Questo return termina solo la closure per l'attributo corrente,
+                // non l'intera remove_event_handlers. Gli attributi normali restano.
                 return true;
             }
 
+            // Siamo nel caso da rimuovere. Ricostruiamo il nome completo per il
+            // report, includendo un eventuale prefisso come "xlink:".
             let attribute_name = match &name.prefix {
                 Some(prefix) => format!("{prefix}:{}", name.local),
                 None => name.local.to_string(),
             };
+            // Il parser ha già interpretato le entità HTML. Per rappresentare
+            // il valore tra virgolette nel report, riapplichiamo le escape.
             let escaped_value = value.replace('&', "&amp;").replace('"', "&quot;");
 
+            // Registriamo cosa eliminiamo e dove, prima che retain lo rimuova.
+            // @ distingue la posizione di un attributo da quella di un elemento.
             actions.push(SanitiseAction {
                 rule: "remove-event-handler".to_string(),
                 location: format!("{location}/@{attribute_name}"),
@@ -57,31 +88,47 @@ pub fn remove_event_handlers(document: &mut Html) -> Vec<SanitiseAction> {
                 replacement: String::new(),
             });
 
+            // Ultima espressione della closure: false ordina la rimozione.
             false
         });
     }
 
+    // Ultima espressione della funzione: restituisce il vettore al chiamante.
     actions
 }
 
 /// Rimuove gli elementi script non autorizzati, insieme al loro contenuto.
 ///
+/// Riceve il DOM modificabile e la policy in sola lettura. A differenza della
+/// regola sugli eventi, può scollegare un intero elemento e i suoi discendenti.
+///
+/// is_script riconosce il tag; is_allowed_script decide se può rimanere.
 /// Gli script HTML esterni sono verificati tramite src, quelli inline tramite
 /// il contenuto esatto. Gli script in altri namespace, come SVG, sono rimossi.
-/// Questa regola non scarica né esegue JavaScript.
+/// Liste di autorizzazione vuote comportano la rimozione di tutti gli script.
+///
+/// Restituisce le azioni da aggiungere al report. Il DOM modificato potrà poi
+/// essere serializzato dal chiamante. Non scarica né esegue JavaScript.
 pub fn remove_disallowed_scripts(
     document: &mut Html,
     policy: &ScriptPolicy,
 ) -> Vec<SanitiseAction> {
-    // Conserviamo frammenti e posizioni prima di rimuovere i nodi, così gli
-    // indici dei fratelli non cambiano mentre costruiamo il report.
+    // Fase 1: individuiamo gli script da rimuovere e prepariamo i dati del report.
+    // Acquisire le posizioni prima delle rimozioni mantiene gli indici originali:
+    // il secondo script rimane script[2] anche se elimineremo il primo.
     let scripts: Vec<_> = document
         .tree
         .root()
         .descendants()
+        // Considera solo i nodi elemento, come nella regola sugli eventi.
         .filter_map(ElementRef::wrap)
+        // && richiede entrambe le condizioni: è uno script e NON è autorizzato.
+        // filter seleziona i candidati, ma non li cancella dal documento.
+        // *element passa la vista dell'elemento alle funzioni, senza copiare il DOM.
         .filter(|element| is_script(*element) && !is_allowed_script(*element, policy))
         .map(|element| {
+            // element.html() conserva la rappresentazione HTML dello script
+            // prima della rimozione. Non è necessariamente la grafia del file.
             let action = SanitiseAction {
                 rule: "remove-disallowed-script".to_string(),
                 location: element_location(element),
@@ -89,65 +136,111 @@ pub fn remove_disallowed_scripts(
                 replacement: String::new(),
             };
 
+            // Salviamo l'ID per ritrovare il nodo nel successivo ciclo modificabile.
             (element.id(), action)
         })
         .collect();
 
     let mut actions = Vec::new();
 
+    // Fase 2: recuperiamo ogni candidato e lo scollegiamo dal documento.
     for (node_id, action) in scripts {
         if let Some(mut node) = document.tree.get_mut(node_id) {
-            // Il sottoalbero viene scollegato: non comparirà nell'HTML prodotto.
+            // detach scollega tutto il sottoalbero: non toglie solo gli attributi.
+            // L'elemento e il suo contenuto non compariranno nell'HTML prodotto.
             node.detach();
+            // Aggiungiamo l'azione dopo aver effettuato la rimozione.
             actions.push(action);
         }
     }
 
+    // Il DOM è stato modificato direttamente; restituiamo solo le azioni.
     actions
 }
 
+/// Riconosce un elemento con nome locale script, senza modificarlo.
+/// È chiamata da remove_disallowed_scripts prima del controllo sulla policy.
+/// Il namespace non viene verificato qui: se ne occupa is_allowed_script.
 fn is_script(element: ElementRef<'_>) -> bool {
+    // value accede ai dati del tag; name() ne legge il nome locale.
+    // Il confronto ignora le differenze ASCII tra maiuscole e minuscole.
     element.value().name().eq_ignore_ascii_case("script")
 }
 
+/// Decide se un elemento già riconosciuto come script è autorizzato.
+///
+/// Riceve una vista dell'elemento e la policy; restituisce soltanto true o false.
+/// Non rimuove nodi: remove_disallowed_scripts userà questa risposta per farlo.
+/// Controlla prima la famiglia dell'elemento, poi src oppure il contenuto inline.
 fn is_allowed_script(element: ElementRef<'_>, policy: &ScriptPolicy) -> bool {
+    // name.ns identifica il namespace, cioè la famiglia del tag (HTML, SVG, ...).
+    // as_ref permette di leggerne il nome come &str.
     let namespace: &str = element.value().name.ns.as_ref();
+    // Questa stringa è l'identificatore convenzionale del namespace HTML:
+    // non è l'URL dello script, non avvia una richiesta HTTP e non controlla
+    // se src usa HTTP o HTTPS. In questa versione autorizziamo solo script HTML;
+    // gli script SVG hanno caratteristiche diverse e vengono rifiutati.
     if namespace != "http://www.w3.org/1999/xhtml" {
         return false;
     }
 
-    // Anche src="" identifica un riferimento esterno: non deve ripiegare
-    // sull'allow-list inline quando il suo URL non è valido.
+    // attr("src") restituisce Some(valore) se l'attributo esiste, None se manca.
+    // Anche src="" entra nel ramo Some: un URL vuoto o invalido non deve
+    // ripiegare sull'allow-list inline e ottenere un'autorizzazione diversa.
     match element.value().attr("src") {
+        // Script esterno: config.rs verifica l'URL contro allowed_sources.
         Some(source) => policy.allows_source(source),
+        // Script inline: text() visita i frammenti testuali; collect li unisce
+        // in una String. config.rs la confronta esattamente con allowed_inline.
         None => policy.allows_inline(&element.text().collect::<String>()),
     }
 }
 
+/// Riconosce i nomi degli attributi che iniziano con on, ignorando il caso.
+/// È usata da remove_event_handlers sia per selezionare gli elementi interessati
+/// sia per decidere quali attributi eliminare. Non modifica il DOM.
+/// Per esempio onclick e ONLOAD corrispondono, class e data-onclick no.
 fn is_event_handler(name: &str) -> bool {
+    // "on" occupa due byte ASCII. get(..2) prova a leggere quel prefisso senza
+    // panic: se la stringa è troppo corta o il limite spezza UTF-8, dà None.
     name.get(..2)
+        // Con Some verifica il prefisso; con None restituisce direttamente false.
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on"))
 }
 
 /// Costruisce un percorso nel DOM con indici tra fratelli dello stesso tipo.
+///
+/// Riceve l'elemento interessato e restituisce una stringa per il campo location
+/// del report, per esempio /html[1]/body[1]/button[2]. Non modifica il documento.
+/// È usata da entrambe le regole di rimozione. L'eventuale suffisso /@onclick
+/// viene aggiunto da remove_event_handlers, non da questa funzione.
 fn element_location(element: ElementRef<'_>) -> String {
+    // Le parti vengono raccolte dal basso verso l'alto, partendo dall'elemento.
     let mut parts = Vec::new();
 
-    // I template contengono un nodo Fragment: lo attraversiamo per risalire
-    // comunque agli elementi antenati e ottenere il percorso completo.
+    // ancestors risale dal genitore verso la radice e non include l'elemento
+    // iniziale. filter_map conserva solo gli antenati che sono elementi.
+    // Così attraversiamo anche il nodo Fragment interno ai template.
     let ancestors = element.ancestors().filter_map(ElementRef::wrap);
+    // once aggiunge l'elemento iniziale; chain prosegue con i suoi antenati.
     for element in std::iter::once(element).chain(ancestors) {
+        // L'indice conta solo i fratelli precedenti con lo stesso nome
+        // qualificato. Tra due button, un p o un commento non conta.
         let index = element
             .prev_siblings()
             .filter_map(ElementRef::wrap)
             .filter(|sibling| sibling.value().name == element.value().name)
             .count()
+            // Gli indici partono da 1: nessun fratello uguale prima => indice 1.
             + 1;
 
+        // Esempio della raccolta: button[2], poi body[1], poi html[1].
         parts.push(format!("{}[{index}]", element.value().name()));
     }
 
+    // Invertiamo le parti per passare dall'ordine elemento->radice a radice->elemento.
     parts.reverse();
+    // Uniamo con / e aggiungiamo lo / iniziale, ottenendo il percorso completo.
     format!("/{}", parts.join("/"))
 }
 
