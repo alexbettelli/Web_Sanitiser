@@ -1,7 +1,7 @@
 # sanitiser-core — Guida alle funzioni implementate
 
 Questa guida accompagna la lettura delle funzioni scritte per il parsing HTML,
-la rimozione degli event handler e il controllo degli script. Ogni sezione
+la rimozione degli event handler, il controllo degli script e i meta refresh. Ogni sezione
 indica il file da aprire e segue i dati dall'ingresso al risultato.
 
 Il collegamento tra le funzioni è questo:
@@ -14,6 +14,8 @@ byte HTML ──► parse_html ──► DOM modificabile
 testo TOML ──► Policy::from_toml │
                     │          │
                     └──────────┼── remove_disallowed_scripts ──► azioni
+                               │
+                               ├── remove_meta_refresh ────────► azioni
                                │
                                └── serialize_html ────────────► byte HTML
 ```
@@ -348,12 +350,58 @@ per rimuovere un eventuale `onload` dobbiamo applicare anche
 L'allow-list degli esterni autorizza il riferimento, non verifica il suo
 contenuto remoto; il fetching rimane un modulo successivo.
 
-## 5. File `src/sanitizer/html.rs`: descrivere la posizione delle modifiche
+## 5. File `src/sanitizer/html.rs`: rimuovere i meta refresh
+
+Restiamo in [src/sanitizer/html.rs](src/sanitizer/html.rs). Un meta refresh
+può chiedere al browser di ricaricare la pagina o aprire un altro URL.
+La regola attuale rimuove tutti questi elementi quando il chiamante la applica.
+
+### `remove_meta_refresh(document)`
+
+```rust
+pub fn remove_meta_refresh(document: &mut Html) -> Vec<SanitiseAction>
+```
+
+**Riceve:** il DOM modificabile. Visita gli elementi e usa `is_meta_refresh`
+per selezionare quelli da rimuovere. Prima raccoglie ID, posizione e frammento
+HTML; poi chiama `detach()` per scollegare ciascun meta dal documento.
+
+Per esempio, elimina `<meta http-equiv="refresh" content="5">` e
+`<meta http-equiv="refresh" content="0; url=https://example.org">`, conservando
+meta come `<meta charset="UTF-8">` e il resto della pagina.
+
+**Restituisce:** le azioni con regola `remove-meta-refresh`, posizione nel DOM,
+frammento precedente alla rimozione e sostituzione vuota. Il chiamante le
+aggiunge al report e passa il DOM modificato alla serializzazione.
+La funzione non interpreta il ritardo o l'URL in `content`: rimuove anche
+i meta refresh con `content` assente, vuoto o non valido.
+
+### `is_meta_refresh(element)`
+
+Questa funzione privata dello stesso file riceve una vista dell'elemento
+e restituisce un `bool`. Verifica che il namespace sia HTML e il nome sia
+`meta`, poi legge `http-equiv`. Se l'attributo manca, restituisce `false`;
+altrimenti confronta il valore con `refresh`, ignorando il caso e gli spazi
+ASCII esterni. Il parser ha già decodificato eventuali entità HTML.
+
+Un attributo `http-equiv="refresh"` su un `div` non ne provoca la rimozione.
+Anche una stringa con quel testo dentro uno script o un commento rimane
+invariata: cerchiamo elementi nel DOM, non sottostringhe nel sorgente.
+
+```text
+remove_meta_refresh                           [src/sanitizer/html.rs]
+  ├── is_meta_refresh → è un meta HTML con http-equiv refresh?
+  ├── element_location + element.html() → dati dell'azione
+  ├── detach → scollega il meta dal documento
+  └── Vec<SanitiseAction> → chiamante → report.actions
+```
+
+## 6. File `src/sanitizer/html.rs`: descrivere la posizione delle modifiche
 
 ### `element_location(element)`
 
 Questa funzione privata di [src/sanitizer/html.rs](src/sanitizer/html.rs)
-è condivisa dalle due regole di rimozione:
+è condivisa dalle regole di rimozione:
 
 ```rust
 fn element_location(element: ElementRef<'_>) -> String
@@ -374,16 +422,16 @@ Le azioni sono definite in [src/report.rs](src/report.rs):
 
 | Campo di `SanitiseAction` | Valore prodotto dalle regole |
 |---|---|
-| `rule` | `remove-event-handler` oppure `remove-disallowed-script` |
+| `rule` | `remove-event-handler`, `remove-disallowed-script` o `remove-meta-refresh` |
 | `location` | Percorso calcolato da `element_location`, con eventuale attributo |
-| `original_fragment` | Attributo ricostruito oppure HTML dello script prima della rimozione |
+| `original_fragment` | Attributo ricostruito oppure HTML dello script o del meta prima della rimozione |
 | `replacement` | Stringa vuota, perché la modifica è una rimozione |
 
 Il frammento deriva dal DOM, quindi può differire dalla formattazione originale.
 Le funzioni restituiscono strutture Rust; il livello di output potrà convertirle
 in JSON usando il modello serializzabile già presente in `src/report.rs`.
 
-## 6. Collegare le funzioni: un esempio di chiamante
+## 7. Collegare le funzioni: un esempio di chiamante
 
 Questo esempio combina le API descritte. È il collegamento da trasferire nel
 motore: [src/sanitizer/engine.rs](src/sanitizer/engine.rs) è ancora vuoto e
@@ -395,7 +443,7 @@ use sanitiser_core::config::Policy;
 use sanitiser_core::parser::html::{parse_html, serialize_html};
 use sanitiser_core::report::SanitiseReport;
 use sanitiser_core::sanitizer::html::{
-    remove_disallowed_scripts, remove_event_handlers,
+    remove_disallowed_scripts, remove_event_handlers, remove_meta_refresh,
 };
 
 fn esempio_pipeline(
@@ -411,6 +459,9 @@ fn esempio_pipeline(
     );
     report.actions.extend(
         remove_disallowed_scripts(&mut document, &policy.scripts),
+    );
+    report.actions.extend(
+        remove_meta_refresh(&mut document),           // src/sanitizer/html.rs
     );
 
     let output = serialize_html(&document);           // src/parser/html.rs
@@ -446,6 +497,6 @@ posizionale oggi non lo carica come policy.
 
 I test delle funzioni si trovano nei blocchi `#[cfg(test)]` di
 `src/parser/html.rs`, `src/config.rs` e `src/sanitizer/html.rs`.
-L'ultima verifica del codice ha completato 17 test con esito positivo.
+L'ultima verifica del codice ha completato 22 test con esito positivo.
 Dalla directory `web_sanitiser` si possono eseguire con
 `cargo test --workspace --offline --locked`, se le dipendenze sono in cache.
